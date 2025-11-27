@@ -13,14 +13,20 @@ import (
 )
 
 type Handler struct {
-	RiskClient *RiskClient
-	LLMRunner  *orchestrator.LLMRunner
+	RiskClient         *RiskClient
+	LLMRunner          *orchestrator.LLMRunner
+	OutputSafetyClient *OutputSafetyClient
 }
 
-func NewHandler(riskClient *RiskClient, llmRunner *orchestrator.LLMRunner) *Handler {
+func NewHandler(
+	riskClient *RiskClient,
+	llmRunner *orchestrator.LLMRunner,
+	outputClient *OutputSafetyClient,
+) *Handler {
 	return &Handler{
-		RiskClient: riskClient,
-		LLMRunner:  llmRunner,
+		RiskClient:         riskClient,
+		LLMRunner:          llmRunner,
+		OutputSafetyClient: outputClient,
 	}
 }
 
@@ -49,27 +55,63 @@ func (h *Handler) ChatHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 2) Decide fast vs slow path
 	path := decidePath(riskResp)
+	mode := path // "fast" or "slow"
 
-	// 3) Build Semantic Sandbox prompt
+	// 3) Scan External Data (Indirect Prompt Injection Defense)
+	// We scan each chunk. If high risk, we mark it as dangerous.
+	for i := range req.ExternalData {
+		// We use the same RiskClient but maybe we want a different threshold or logic later.
+		// For now, we just check the content.
+		risk, err := h.RiskClient.ScorePrompt(ctx, req.ExternalData[i].Content, req.UserID, req.SessionID)
+		if err != nil {
+			log.Printf("error scanning external data %s: %v", req.ExternalData[i].ID, err)
+			// Fail open or closed? Let's fail open but log it for now, or maybe mark dangerous?
+			// Let's mark dangerous to be safe if we can't scan.
+			req.ExternalData[i].IsDangerous = true
+			continue
+		}
+
+		if risk.RiskLevel == "HIGH" {
+			log.Printf("external data %s flagged as HIGH risk", req.ExternalData[i].ID)
+			req.ExternalData[i].IsDangerous = true
+		}
+	}
+
+	// 4) Build Semantic Sandbox prompt
 	sbInput := sandbox.SandboxInput{
 		UserMessage: req.Message,
 		Risk:        riskResp,
-		External:    nil, // we'll add external content later
+		External:    req.ExternalData,
 		UserID:      req.UserID,
 		SessionID:   req.SessionID,
 	}
 	sbOutput := sandbox.BuildPrompt(sbInput)
 
 	// 4) Run inside Docker sandbox (LLM System Sandbox)
-	answer, err := h.LLMRunner.RunInSandbox(ctx, sbOutput.SystemPrompt, sbOutput.UserContent)
+	draftAnswer, err := h.LLMRunner.RunInSandbox(ctx, sbOutput.SystemPrompt, sbOutput.UserContent)
 	if err != nil {
 		log.Printf("LLM sandbox error (path=%s): %v", path, err)
 		http.Error(w, "internal error (llm sandbox)", http.StatusInternalServerError)
 		return
 	}
 
+	// 5) Output Safety Layer
+	outResp, err := h.OutputSafetyClient.Review(
+		ctx,
+		req.Message, // original user prompt
+		draftAnswer, // draft answer from LLM sandbox
+		riskResp.RiskLevel,
+		riskResp.Flags,
+		mode,
+	)
+	if err != nil {
+		log.Printf("output safety error (path=%s): %v", path, err)
+		http.Error(w, "internal error (output safety)", http.StatusInternalServerError)
+		return
+	}
+
 	resp := types.ChatResponse{
-		Answer:    answer,
+		Answer:    outResp.FinalAnswer,
 		RiskLevel: riskResp.RiskLevel,
 		Path:      path,
 	}
